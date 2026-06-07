@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.sparse import lil_matrix, csc_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from typing import Tuple, Optional, List
 import config
 
@@ -97,20 +97,39 @@ def _trace_ray_straight(
     if distance < 1e-6:
         return {"path_length": 0.0, "cells": {}, "distance": 0.0}
 
-    n_steps = max(int(distance / min(model.dx, model.dy, model.dz) * 3), 100)
-    cells = {}
+    min_cell = min(model.dx, model.dy, model.dz)
+    n_steps = max(int(distance / min_cell * 2), 100)
+    n_steps = min(n_steps, 5000)
+
     dx_step = (rx - sx) / n_steps
     dy_step = (ry - sy) / n_steps
     dz_step = (rz - sz) / n_steps
     step_len = distance / n_steps
 
-    for i in range(n_steps + 1):
-        px = sx + i * dx_step
-        py = sy + i * dy_step
-        pz = sz + i * dz_step
-        cell_idx = model._xyz_to_cell(px, py, pz)
-        if cell_idx is not None:
-            cells[cell_idx] = cells.get(cell_idx, 0.0) + step_len
+    px_all = sx + np.arange(n_steps + 1) * dx_step
+    py_all = sy + np.arange(n_steps + 1) * dy_step
+    pz_all = sz + np.arange(n_steps + 1) * dz_step
+
+    ix_all = (px_all / model.dx).astype(np.int32)
+    iy_all = (py_all / model.dy).astype(np.int32)
+    iz_all = (pz_all / model.dz).astype(np.int32)
+
+    valid = (
+        (ix_all >= 0) & (ix_all < model.nx) &
+        (iy_all >= 0) & (iy_all < model.ny) &
+        (iz_all >= 0) & (iz_all < model.nz)
+    )
+
+    ix_valid = ix_all[valid]
+    iy_valid = iy_all[valid]
+    iz_valid = iz_all[valid]
+
+    cell_indices = iz_valid * (model.nx * model.ny) + iy_valid * model.nx + ix_valid
+
+    unique_cells, counts = np.unique(cell_indices, return_counts=True)
+    path_lengths = counts.astype(np.float64) * step_len
+
+    cells = dict(zip(unique_cells.tolist(), path_lengths.tolist()))
 
     return {"path_length": distance, "cells": cells, "distance": distance}
 
@@ -120,11 +139,15 @@ def build_sensitivity_matrix(
     stations: List[Station],
     events: List[Event],
     phase: str = "P",
-) -> Tuple[csc_matrix, np.ndarray]:
+) -> Tuple[csr_matrix, np.ndarray]:
     n_rays = len(events) * len(stations)
     n_params = model.n_cells
+    v0 = model.vp if phase == "P" else model.vs
+    coeff = -1.0 / (v0 ** 2)
 
-    G = lil_matrix((n_rays, n_params))
+    row_list = []
+    col_list = []
+    val_list = []
     dt = np.zeros(n_rays)
 
     ray_idx = 0
@@ -134,15 +157,28 @@ def build_sensitivity_matrix(
             rcv = (sta.x, sta.y, sta.z)
 
             ray = _trace_ray_straight(src, rcv, model)
-            v0 = model.vp if phase == "P" else model.vs
-            if ray["path_length"] > 0:
-                for cell_idx, path_len in ray["cells"].items():
-                    G[ray_idx, cell_idx] = -path_len / (v0 ** 2)
+            if ray["path_length"] > 0 and ray["cells"]:
+                cells = ray["cells"]
+                cell_ids = np.array(list(cells.keys()), dtype=np.int64)
+                path_lens = np.array(list(cells.values()), dtype=np.float64)
+
+                row_list.append(np.full(len(cell_ids), ray_idx, dtype=np.int64))
+                col_list.append(cell_ids)
+                val_list.append(coeff * path_lens)
+
                 dt[ray_idx] = ray["distance"] / v0
 
             ray_idx += 1
 
-    return csc_matrix(G), dt
+    if row_list:
+        rows = np.concatenate(row_list)
+        cols = np.concatenate(col_list)
+        vals = np.concatenate(val_list)
+        G = coo_matrix((vals, (rows, cols)), shape=(n_rays, n_params)).tocsr()
+    else:
+        G = csr_matrix((n_rays, n_params))
+
+    return G, dt
 
 
 def build_travel_time_residuals(
@@ -151,7 +187,7 @@ def build_travel_time_residuals(
     events: List[Event],
     observed_arrivals: np.ndarray,
     phase: str = "P",
-) -> Tuple[csc_matrix, np.ndarray]:
+) -> Tuple[csr_matrix, np.ndarray]:
     G, t_calc = build_sensitivity_matrix(model, stations, events, phase)
     residuals = observed_arrivals - t_calc
     return G, residuals
