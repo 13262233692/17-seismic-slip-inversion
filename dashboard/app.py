@@ -12,7 +12,16 @@ from seismic_waveform.picker import sta_lta_pick, recursive_sta_lta_pick
 from seismic_waveform.arrivals import build_arrivals_dataframe, compute_residuals
 from seismic_tomography.model import VelocityModel, Station, Event, build_sensitivity_matrix, build_travel_time_residuals
 from seismic_tomography.inversion import lsqr_inversion, svd_inversion, iterative_inversion
-from seismic_tomography.render import render_isosurface, render_cross_sections, render_fault_zones
+from seismic_tomography.focal_mechanism import (
+    compute_p_polarity, compute_azimuth_takeoff,
+    grid_search_focal_mechanism, classify_fault_type,
+    generate_beachball_svg, generate_beachball_contours,
+    generate_beachball_plotly_3d,
+)
+from seismic_tomography.render import (
+    render_isosurface, render_cross_sections, render_fault_zones,
+    render_beachball_2d, render_fault_zones_with_beachballs,
+)
 
 
 def create_app():
@@ -27,6 +36,7 @@ def create_app():
             dcc.Tab(label="到时拾取", value="picking-tab"),
             dcc.Tab(label="层析成像", value="tomography-tab"),
             dcc.Tab(label="三维断层渲染", value="render-tab"),
+            dcc.Tab(label="震源机制", value="focal-tab"),
         ]),
 
         html.Div(id="tab-content"),
@@ -42,6 +52,8 @@ def create_app():
             return _tomography_tab()
         elif tab == "render-tab":
             return _render_tab()
+        elif tab == "focal-tab":
+            return _focal_tab()
         return html.Div()
 
     def _waveform_tab():
@@ -139,7 +151,29 @@ def create_app():
             dcc.Graph(id="isosurface-graph"),
         ])
 
-    _app_data = {"st": None, "st_filtered": None, "arrivals_df": None, "model": None, "anomaly": None}
+    def _focal_tab():
+        return html.Div([
+            html.H3("震源机制解 (Beachball)"),
+            html.Div([
+                html.Label("走向步长 (°):"),
+                dcc.Input(id="strike-step", type="number", value=config.GRID_SEARCH_STRIKE_STEP, style={"width": "80px"}),
+                html.Label("倾角步长 (°):"),
+                dcc.Input(id="dip-step", type="number", value=config.GRID_SEARCH_DIP_STEP, style={"width": "80px"}),
+                html.Label("滑动角步长 (°):"),
+                dcc.Input(id="rake-step", type="number", value=config.GRID_SEARCH_RAKE_STEP, style={"width": "80px"}),
+            ], style={"marginBottom": "10px"}),
+            html.Div([
+                html.Label("沙滩球3D缩放:"),
+                dcc.Input(id="bb-scale", type="number", value=config.BEACHBALL_SCALE_3D, style={"width": "80px"}),
+            ], style={"marginBottom": "10px"}),
+            html.Button("运行震源机制分析", id="focal-btn", n_clicks=0),
+            html.Button("使用样本数据", id="focal-sample-btn", n_clicks=0),
+            dcc.Graph(id="beachball-2d-graph"),
+            dcc.Graph(id="beachball-3d-graph"),
+            html.Div(id="focal-info"),
+        ])
+
+    _app_data = {"st": None, "st_filtered": None, "arrivals_df": None, "model": None, "anomaly": None, "focal_mechanisms": []}
 
     @app.callback(
         [Output("waveform-graph", "figure"), Output("waveform-info", "children")],
@@ -352,6 +386,110 @@ def create_app():
             title_text="P波(红线) / S波(蓝线) 拾取结果",
         )
         return fig
+
+    @app.callback(
+        [Output("beachball-2d-graph", "figure"), Output("beachball-3d-graph", "figure"), Output("focal-info", "children")],
+        [Input("focal-btn", "n_clicks"), Input("focal-sample-btn", "n_clicks")],
+        [State("strike-step", "value"), State("dip-step", "value"), State("rake-step", "value"), State("bb-scale", "value")],
+    )
+    def run_focal_mechanism(clicks, sample_clicks, strike_step, dip_step, rake_step, bb_scale):
+        ctx = dash.callback_context
+        if not ctx.triggered:
+            return go.Figure(), go.Figure(), ""
+
+        st = _app_data.get("st_filtered") or _app_data.get("st")
+        if st is None:
+            from generate_sample_data import generate_synthetic_network
+            st = generate_synthetic_network(n_stations=8, snr=8.0)
+            st = butterworth_bandpass(st)
+            _app_data["st_filtered"] = st
+
+        df = build_arrivals_dataframe(st, method="classic", extract_polarity=True)
+        p_picks = df[df["phase"] == "P"]
+
+        stations = []
+        for i in range(8):
+            angle = 2 * np.pi * i / 8
+            stations.append(Station(
+                name=f"S{i + 1:02d}", network="SY",
+                x_km=50 + 35 * np.cos(angle),
+                y_km=50 + 35 * np.sin(angle),
+            ))
+
+        events = [
+            Event(x_km=50, y_km=50, z_km=15),
+            Event(x_km=45, y_km=55, z_km=20),
+            Event(x_km=55, y_km=45, z_km=10),
+        ]
+
+        focal_mechanisms = []
+        for ev in events:
+            polarities = compute_p_polarity(st, [
+                {"network": r["network"], "station": r["station"],
+                 "phase": "P", "arrival_time": r["arrival_time"]}
+                for _, r in p_picks.iterrows()
+            ])
+
+            result = grid_search_focal_mechanism(
+                polarities, ev.x, ev.y, ev.z, stations,
+                strike_step=strike_step, dip_step=dip_step, rake_step=rake_step,
+            )
+
+            focal_mechanisms.append({
+                "strike": result["strike"], "dip": result["dip"], "rake": result["rake"],
+                "x": ev.x, "y": ev.y, "z": ev.z,
+                "score": result["score"], "fault_type": result["fault_type"],
+                "observations": result.get("observations", []),
+            })
+
+        _app_data["focal_mechanisms"] = focal_mechanisms
+
+        fig_2d = render_beachball_2d(
+            focal_mechanisms[0]["strike"], focal_mechanisms[0]["dip"], focal_mechanisms[0]["rake"],
+            observations=focal_mechanisms[0].get("observations"),
+        )
+
+        anomaly = _app_data.get("anomaly")
+        model = _app_data.get("model")
+        if anomaly is not None and model is not None:
+            fig_3d = render_fault_zones_with_beachballs(
+                anomaly, model.dx, model.dy, model.dz,
+                focal_mechanisms=focal_mechanisms, beachball_scale=bb_scale,
+            )
+        else:
+            fig_3d = go.Figure()
+            for fm in focal_mechanisms:
+                bb = generate_beachball_plotly_3d(
+                    fm["strike"], fm["dip"], fm["rake"],
+                    observations=fm.get("observations"),
+                    center_x=fm["x"], center_y=fm["y"], center_z=fm["z"],
+                    scale=bb_scale,
+                )
+                vals = np.array(bb["value"])
+                fig_3d.add_trace(go.Scatter3d(
+                    x=bb["x"], y=bb["y"], z=bb["z"],
+                    mode="markers",
+                    marker=dict(size=3, color=vals,
+                                colorscale=[[0, "#3030E0"], [0.5, "#808080"], [1, "#E03030"]],
+                                cmin=vals.min(), cmax=vals.max(), opacity=0.9),
+                    name=f"S={fm['strike']:.0f}° D={fm['dip']:.0f}° R={fm['rake']:.0f}°",
+                ))
+            fig_3d.update_layout(
+                title="Focal Mechanisms (3D)",
+                scene=dict(xaxis_title="X (km)", yaxis_title="Y (km)", zaxis_title="Depth (km)",
+                           zaxis=dict(autorange="reversed")),
+                width=900, height=700,
+            )
+
+        info_parts = []
+        for i, fm in enumerate(focal_mechanisms):
+            info_parts.append(
+                f"事件{i + 1}: Strike={fm['strike']:.0f}° Dip={fm['dip']:.0f}° "
+                f"Rake={fm['rake']:.0f}° [{fm['fault_type']}] 拟合={fm['score']:.0%}"
+            )
+        info_text = " | ".join(info_parts)
+
+        return fig_2d, fig_3d, html.P(info_text)
 
     def _generate_tomography_sample(nx, ny, nz):
         np.random.seed(42)

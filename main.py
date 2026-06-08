@@ -11,7 +11,16 @@ from seismic_waveform.filter import butterworth_bandpass
 from seismic_waveform.arrivals import build_arrivals_dataframe, export_arrivals_csv, compute_residuals
 from seismic_tomography.model import VelocityModel, Station, Event, build_sensitivity_matrix, build_travel_time_residuals
 from seismic_tomography.inversion import lsqr_inversion, svd_inversion, iterative_inversion
-from seismic_tomography.render import render_isosurface, render_cross_sections, render_fault_zones
+from seismic_tomography.focal_mechanism import (
+    compute_p_polarity, compute_azimuth_takeoff,
+    grid_search_focal_mechanism, classify_fault_type,
+    generate_beachball_svg, generate_beachball_contours,
+    generate_beachball_plotly_3d,
+)
+from seismic_tomography.render import (
+    render_isosurface, render_cross_sections, render_fault_zones,
+    render_beachball_2d, render_fault_zones_with_beachballs,
+)
 
 
 def run_waveform_pipeline(args):
@@ -162,6 +171,128 @@ def run_tomography_pipeline(args):
     return model, anomaly_3d
 
 
+def run_focal_mechanism_pipeline(args):
+    print("\n" + "=" * 60)
+    print("  链路三: 震源机制解 (Focal Mechanism / Beachball)")
+    print("=" * 60)
+
+    print("\n[1/5] 生成合成波形数据并提取 P 波极性...")
+    from generate_sample_data import generate_synthetic_network
+    st = generate_synthetic_network(n_stations=8, snr=8.0)
+    st_filtered = butterworth_bandpass(st)
+
+    df = build_arrivals_dataframe(st_filtered, method="classic", extract_polarity=True)
+    p_picks = df[df["phase"] == "P"]
+    print(f"  P 波拾取数: {len(p_picks)}")
+    if "polarity" in df.columns:
+        pos_count = len(p_picks[p_picks["polarity"] > 0])
+        neg_count = len(p_picks[p_picks["polarity"] < 0])
+        zero_count = len(p_picks[p_picks["polarity"] == 0])
+        print(f"  极性分布: 压缩(+)={pos_count}, 膨胀(-)={neg_count}, 未定={zero_count}")
+
+    print("\n[2/5] 构建台站布局与事件位置...")
+    stations = []
+    for i in range(8):
+        angle = 2 * np.pi * i / 8
+        stations.append(Station(
+            name=f"S{i + 1:02d}", network="SY",
+            x_km=50 + 35 * np.cos(angle),
+            y_km=50 + 35 * np.sin(angle),
+        ))
+
+    np.random.seed(42)
+    events = [
+        Event(x_km=50, y_km=50, z_km=15),
+        Event(x_km=45, y_km=55, z_km=20),
+        Event(x_km=55, y_km=45, z_km=10),
+    ]
+    print(f"  台站数: {len(stations)}, 事件数: {len(events)}")
+
+    print("\n[3/5] 格点网格搜索最优断层面解 (Strike/Dip/Rake)...")
+    focal_mechanisms = []
+
+    for ev_idx, ev in enumerate(events):
+        polarities = compute_p_polarity(st_filtered, [
+            {"network": r["network"], "station": r["station"],
+             "phase": "P", "arrival_time": r["arrival_time"]}
+            for _, r in p_picks.iterrows()
+        ])
+
+        result = grid_search_focal_mechanism(
+            polarities, ev.x, ev.y, ev.z, stations,
+            strike_step=args.strike_step,
+            dip_step=args.dip_step,
+            rake_step=args.rake_step,
+        )
+
+        fm = {
+            "strike": result["strike"],
+            "dip": result["dip"],
+            "rake": result["rake"],
+            "x": ev.x, "y": ev.y, "z": ev.z,
+            "score": result["score"],
+            "fault_type": result["fault_type"],
+            "observations": result.get("observations", []),
+        }
+        focal_mechanisms.append(fm)
+
+        print(f"\n  事件 {ev_idx + 1} (x={ev.x:.1f}, y={ev.y:.1f}, z={ev.z:.1f} km):")
+        print(f"    Strike = {result['strike']:.0f}°")
+        print(f"    Dip    = {result['dip']:.0f}°")
+        print(f"    Rake   = {result['rake']:.0f}°")
+        print(f"    破裂类型: {result['fault_type']}")
+        print(f"    拟合率: {result['score']:.1%} ({result.get('n_correct', '?')}/{result.get('n_observations', '?')})")
+
+    print("\n[4/5] 生成沙滩球 SVG 图元...")
+    os.makedirs(config.DATA_DIR, exist_ok=True)
+    for i, fm in enumerate(focal_mechanisms):
+        svg = generate_beachball_svg(
+            fm["strike"], fm["dip"], fm["rake"],
+            observations=fm.get("observations"),
+            size=config.BEACHBALL_SVG_SIZE,
+        )
+        svg_path = os.path.join(config.DATA_DIR, f"beachball_event{i + 1}.svg")
+        with open(svg_path, "w", encoding="utf-8") as f:
+            f.write(svg)
+        print(f"  事件 {i + 1} SVG 已保存至: {svg_path}")
+
+        fig_2d = render_beachball_2d(fm["strike"], fm["dip"], fm["rake"], fm.get("observations"))
+        html_path = os.path.join(config.DATA_DIR, f"beachball_event{i + 1}.html")
+        fig_2d.write_html(html_path)
+        print(f"  事件 {i + 1} 2D 沙滩球图已保存至: {html_path}")
+
+    print("\n[5/5] 三维断层带 + 沙滩球联合渲染...")
+    nx, ny, nz = config.GRID_NX, config.GRID_NY, config.GRID_NZ
+    model = VelocityModel(nx=nx, ny=ny, nz=nz)
+
+    G, t_calc = build_sensitivity_matrix(model, stations, events, phase="P")
+    n_rays = len(events) * len(stations)
+    observed_dt = np.zeros(n_rays)
+    ray_idx = 0
+    np.random.seed(42)
+    for ev in events:
+        for sta in stations:
+            dist = np.sqrt((ev.x - sta.x) ** 2 + (ev.y - sta.y) ** 2 + (ev.z - sta.z) ** 2)
+            observed_dt[ray_idx] = dist / 6.0 + np.random.randn() * 0.01
+            ray_idx += 1
+    residuals = observed_dt - t_calc
+
+    dm, info = lsqr_inversion(G, residuals, nx, ny, nz)
+    model.dv = dm
+    anomaly_3d = model.get_3d_anomaly()
+
+    fig_combined = render_fault_zones_with_beachballs(
+        anomaly_3d, model.dx, model.dy, model.dz,
+        focal_mechanisms=focal_mechanisms,
+        beachball_scale=config.BEACHBALL_SCALE_3D,
+    )
+    output_html = os.path.join(config.DATA_DIR, "fault_zones_with_beachballs.html")
+    fig_combined.write_html(output_html)
+    print(f"  三维断层+沙滩球渲染已保存至: {output_html}")
+
+    return focal_mechanisms
+
+
 def main():
     parser = argparse.ArgumentParser(description="地震滑移反演分析系统")
 
@@ -189,6 +320,11 @@ def main():
     tomo_parser.add_argument("--smoothing", type=float, default=config.SMOOTHING)
     tomo_parser.add_argument("--max-iter", type=int, default=config.MAX_ITERATIONS)
 
+    focal_parser = subparsers.add_parser("focal", help="震源机制解 (Beachball)")
+    focal_parser.add_argument("--strike-step", type=float, default=config.GRID_SEARCH_STRIKE_STEP)
+    focal_parser.add_argument("--dip-step", type=float, default=config.GRID_SEARCH_DIP_STEP)
+    focal_parser.add_argument("--rake-step", type=float, default=config.GRID_SEARCH_RAKE_STEP)
+
     dash_parser = subparsers.add_parser("dashboard", help="启动交互式面板")
     dash_parser.add_argument("--port", type=int, default=8050)
     dash_parser.add_argument("--debug", action="store_true")
@@ -201,6 +337,8 @@ def main():
         run_waveform_pipeline(args)
     elif args.command == "tomography":
         run_tomography_pipeline(args)
+    elif args.command == "focal":
+        run_focal_mechanism_pipeline(args)
     elif args.command == "dashboard":
         from dashboard.app import create_app
         app = create_app()
@@ -221,6 +359,13 @@ def main():
             smoothing=config.SMOOTHING, max_iter=config.MAX_ITERATIONS,
         )
         run_tomography_pipeline(tomo_args)
+
+        focal_args = argparse.Namespace(
+            strike_step=config.GRID_SEARCH_STRIKE_STEP,
+            dip_step=config.GRID_SEARCH_DIP_STEP,
+            rake_step=config.GRID_SEARCH_RAKE_STEP,
+        )
+        run_focal_mechanism_pipeline(focal_args)
     else:
         parser.print_help()
 

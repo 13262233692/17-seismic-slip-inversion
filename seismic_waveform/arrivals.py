@@ -2,6 +2,7 @@ import pandas as pd
 from obspy import Stream
 from typing import List, Optional
 from seismic_waveform.picker import sta_lta_pick, recursive_sta_lta_pick
+from seismic_tomography.focal_mechanism import compute_p_polarity
 
 
 def build_arrivals_dataframe(
@@ -11,6 +12,7 @@ def build_arrivals_dataframe(
     lta_sec: float = None,
     p_threshold: float = None,
     s_threshold: float = None,
+    extract_polarity: bool = False,
 ) -> pd.DataFrame:
     if method == "recursive":
         picks = recursive_sta_lta_pick(
@@ -23,11 +25,14 @@ def build_arrivals_dataframe(
             p_threshold=p_threshold, s_threshold=s_threshold,
         )
 
+    if extract_polarity and picks:
+        picks = compute_p_polarity(st, picks)
+
     if not picks:
-        return pd.DataFrame(columns=[
-            "network", "station", "phase", "arrival_time",
-            "arrival_time_str", "relative_delay_ms",
-        ])
+        cols = ["network", "station", "phase", "arrival_time", "arrival_time_str", "relative_delay_ms"]
+        if extract_polarity:
+            cols.append("polarity")
+        return pd.DataFrame(columns=cols)
 
     p_times = [p["arrival_time"] for p in picks if p["phase"] == "P"]
     if p_times:
@@ -38,14 +43,17 @@ def build_arrivals_dataframe(
     records = []
     for p in picks:
         relative_delay = (p["arrival_time"] - reference_time) * 1000.0
-        records.append({
+        rec = {
             "network": p["network"],
             "station": p["station"],
             "phase": p["phase"],
             "arrival_time": p["arrival_time"],
             "arrival_time_str": str(p["arrival_time"]),
             "relative_delay_ms": round(relative_delay, 2),
-        })
+        }
+        if extract_polarity:
+            rec["polarity"] = p.get("polarity", 0)
+        records.append(rec)
 
     df = pd.DataFrame(records)
     df = df.sort_values(["phase", "relative_delay_ms"]).reset_index(drop=True)

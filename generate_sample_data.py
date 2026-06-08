@@ -38,15 +38,16 @@ def _generate_station_trace(
     snr: float = 8.0,
     f0: float = 5.0,
     channel: str = "BHZ",
+    p_polarity: int = 1,
 ) -> np.ndarray:
     npts = int(duration * sampling_rate)
     noise = np.random.randn(npts) * 0.1
 
     if channel[-1].upper() in ("Z", "1"):
-        p_amp = snr * 0.15
+        p_amp = snr * 0.15 * p_polarity
         s_amp = snr * 0.06
     else:
-        p_amp = snr * 0.06
+        p_amp = snr * 0.06 * p_polarity
         s_amp = snr * 0.15
 
     p_signal = _earthquake_signal(npts, sampling_rate, p_arrival_sec, f0, 3.0, p_amp)
@@ -64,12 +65,13 @@ def generate_synthetic_station(
     s_arrival_sec: float,
     starttime: UTCDateTime,
     snr: float = 5.0,
+    p_polarity: int = 1,
 ) -> Stream:
     st = Stream()
     for ch in ["BHZ", "BHN", "BHE"]:
         data = _generate_station_trace(
             sampling_rate, duration, p_arrival_sec, s_arrival_sec,
-            snr=snr, channel=ch,
+            snr=snr, channel=ch, p_polarity=p_polarity,
         )
         tr = Trace(data=data)
         tr.stats.network = network
@@ -94,6 +96,12 @@ def generate_synthetic_network(
     epicenter_dist_base = 20.0
     lta_buffer_sec = 12.0
 
+    fault_strike = 45.0
+    fault_dip = 60.0
+    fault_rake = 0.0
+
+    M = _compute_moment_tensor(fault_strike, fault_dip, fault_rake)
+
     for i in range(n_stations):
         station_name = f"S{i + 1:02d}"
         dist_km = epicenter_dist_base + i * 10 + np.random.randn() * 3
@@ -109,6 +117,12 @@ def generate_synthetic_network(
 
         s_arrival = max(p_arrival + 2.0, s_arrival)
 
+        station_angle = 2 * np.pi * i / n_stations
+        r_vec = np.array([np.sin(station_angle), np.cos(station_angle), 0.3])
+        r_vec = r_vec / np.linalg.norm(r_vec)
+        amplitude = r_vec @ M @ r_vec
+        p_polarity = 1 if amplitude >= 0 else -1
+
         station_st = generate_synthetic_station(
             network="SY",
             station=station_name,
@@ -118,10 +132,31 @@ def generate_synthetic_network(
             s_arrival_sec=s_arrival,
             starttime=origin_time,
             snr=snr,
+            p_polarity=p_polarity,
         )
         st += station_st
 
     return st
+
+
+def _compute_moment_tensor(strike: float, dip: float, rake: float) -> np.ndarray:
+    sd = np.radians(strike)
+    dd = np.radians(dip)
+    lam = np.radians(rake)
+
+    M = np.zeros((3, 3))
+    M[0, 0] = -(np.sin(dd) * np.cos(lam) * np.sin(2 * sd)
+                 + np.sin(2 * dd) * np.sin(lam) * np.sin(sd) ** 2)
+    M[1, 1] = (np.sin(dd) * np.cos(lam) * np.sin(2 * sd)
+                - np.sin(2 * dd) * np.sin(lam) * np.cos(sd) ** 2)
+    M[2, 2] = np.sin(2 * dd) * np.sin(lam)
+    M[0, 1] = np.sin(dd) * np.cos(lam) * np.cos(2 * sd) + 0.5 * np.sin(2 * dd) * np.sin(lam) * np.sin(2 * sd)
+    M[1, 0] = M[0, 1]
+    M[0, 2] = -(np.cos(dd) * np.cos(lam) * np.cos(sd) - np.cos(2 * dd) * np.sin(lam) * np.sin(sd))
+    M[2, 0] = M[0, 2]
+    M[1, 2] = -(np.cos(dd) * np.cos(lam) * np.sin(sd) + np.cos(2 * dd) * np.sin(lam) * np.cos(sd))
+    M[2, 1] = M[1, 2]
+    return M
 
 
 def generate_and_save_mseed(output_dir: str = None) -> str:
